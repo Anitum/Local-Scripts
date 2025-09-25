@@ -1,0 +1,23 @@
+name: Deploy RTSP Script
+
+on:
+  push:
+    branches:
+      - "an1tum-trial"
+jobs:
+  deploy:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run nmap discovery
+        run: sudo ./P_nmap.sh
+
+      - name: Set RTSP credentials
+        run: echo "Using brand1-loc1 creds"
+        env:
+          RTSP_USER: ${{ secrets.RTSP_USER_BRAND1_LOC1 }}
+          RTSP_PASS: ${{ secrets.RTSP_PASS_BRAND1_LOC1 }}
+
+      - name: Run RTSP setup
+        run: echo "${{ secrets.SUDO_PASS }}" | sudo -S ./P_service_setup.sh
