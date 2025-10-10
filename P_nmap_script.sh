@@ -16,3 +16,4 @@ for ip in $IP; do
 done
 
 #assumptions ipv4 and 554 ports are rtsp
+#add documentation for hardcoded args
