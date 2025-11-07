@@ -1,73 +1,165 @@
 #!/bin/bash
+set -euo pipefail
 
-# Fast monitor script for uploading completed .mkv files to S3
-# Designed for high frequency file processing (~32 files every 90 seconds)
-# Immediately uploads completed files and removes them after successful upload
-
+# ─────────────────────────────────────────────────────────────
+# Config
 LOG_FILE="upload_monitor.log"
-S3_BUCKET="anitum-jk/videos0" (add your bucket)
-CHECK_INTERVAL=1  # Check every second for new completed files
+S3_BUCKET="anitum-jk-production"   # bucket only (no trailing slash)
+CHECK_INTERVAL=1                   # used only in fallback polling mode
+MAX_PARALLEL=6                     # tune this to your CPU / network
+RETRY_MAX=5
+RETRY_BASE=2                       # seconds, exponential backoff base
+LOCATION="nungambakkam"
+
+
+if [[ -z "${LOCATION}" ]]; then
+  echo "Usage: LOCATION=<prefix> $0   OR   $0 <prefix>"
+  echo "Example: LOCATION=ntu $0"
+  exit 1
+fi
+
+# Ensure AWS CLI configured and in PATH
+command -v aws >/dev/null || { echo "aws CLI not found"; exit 1; }
 
 log_message() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
 }
 
-log_message "Starting fast MKV file upload monitor"
+# ─────────────────────────────────────────────────────────────
+# Concurrency semaphore (same as before)
+init_semaphore() {
+  SEM=/tmp/upload_semaphore.$$
+  mkfifo "$SEM"
+  exec 9<>"$SEM"
+  rm "$SEM"
+  for ((i=0;i<MAX_PARALLEL;i++)); do printf "%s\n" "token" >&9; done
+}
+acquire_token() { read -r -u 9 _ || return 1; }
+release_token() { printf "%s\n" "token" >&9; }
 
-# Function to handle file upload and removal
-process_file() {
-    local file="$1"
-    
-    # First quick check if file exists and is not being written
-    if [ ! -f "$file" ] || lsof "$file" >/dev/null 2>&1; then
-        return 1
-    fi
-    
-    # Quick size stability check (half second)
-    local size1=$(stat -c %s "$file" 2>/dev/null)
-    sleep 0.5
-    local size2=$(stat -c %s "$file" 2>/dev/null)
-    
-    if [ "$size1" != "$size2" ] || [ -z "$size1" ]; then
-        return 1
-    fi
-    
-    # File is complete, upload to S3
-    log_message "Uploading $file to S3 bucket $S3_BUCKET"
-    
-    if aws s3 cp "$file" "s3://$S3_BUCKET/" --only-show-errors; then
-        log_message "Successfully uploaded $file to S3"
-        
-        # Remove the file after successful upload
-        if rm "$file"; then
-            log_message "Removed $file from local storage"
-        else
-            log_message "Failed to remove $file from local storage"
-        fi
-        
-        return 0
+graceful_shutdown() {
+  log_message "Shutting down: waiting for active uploads to finish..."
+  shutting_down=1
+  wait
+  log_message "Shutdown complete"
+  exit 0
+}
+trap graceful_shutdown SIGINT SIGTERM
+
+# ─────────────────────────────────────────────────────────────
+# Extract YYYY/MM/DD/HH from filename like: *_YYYYMMDDTHHMMSS*.mkv
+# If not present, use current local time.
+# Returns 5 values via echo: YEAR MONTH DAY HOUR DEST_BASENAME
+build_s3_parts() {
+  local file="$1"
+  local base
+  base="$(basename -- "$file")"
+
+  local ymd="" hms=""
+  if [[ "$base" =~ ([0-9]{8})T([0-9]{6}) ]]; then
+    ymd="${BASH_REMATCH[1]}"
+    hms="${BASH_REMATCH[2]}"
+  else
+    # Fallback to system time
+    ymd="$(date +%Y%m%d)"
+    hms="$(date +%H%M%S)"
+  fi
+
+  local year="${ymd:0:4}"
+  local month="${ymd:4:2}"
+  local day="${ymd:6:2}"
+  local hour="${hms:0:2}"
+
+  # Prepend location to filename if not already
+  local dest_name="$base"
+  case "$base" in
+    ${LOCATION}_*) : ;;                             # already prefixed
+    *) dest_name="${LOCATION}_$base" ;;
+  esac
+
+  echo "$year" "$month" "$day" "$hour" "$dest_name"
+}
+
+# ─────────────────────────────────────────────────────────────
+# Upload with retries to computed key
+upload_with_retries() {
+  local file="$1"
+  read -r YEAR MONTH DAY HOUR DEST_NAME < <(build_s3_parts "$file")
+
+  local key="${LOCATION}/${YEAR}/${MONTH}/${DAY}/${HOUR}/${DEST_NAME}"
+  local attempt=0
+  while [[ $attempt -le $RETRY_MAX ]]; do
+    if aws s3 mv --only-show-errors -- "$file" "s3://${S3_BUCKET}/${key}"; then
+      log_message "UPLOAD OK: $file -> s3://${S3_BUCKET}/${key}"
+      return 0
     else
-        log_message "Failed to upload $file to S3"
+      attempt=$((attempt+1))
+      if [[ $attempt -gt $RETRY_MAX ]]; then
+        log_message "UPLOAD FAILED: $file after $RETRY_MAX attempts (dest s3://${S3_BUCKET}/${key})"
         return 1
+      fi
+      local sleep_time=$((RETRY_BASE ** attempt))
+      log_message "Upload failed for $file, retry #$attempt in ${sleep_time}s (dest s3://${S3_BUCKET}/${key})"
+      sleep "$sleep_time"
     fi
+  done
 }
 
-while true; do
-    # Use find to get all .mkv files, process each one immediately
-    find . -maxdepth 1 -name "*.mkv" -type f | while read -r file; do
-        # Process each file in a background subshell to handle multiple files concurrently
-        (process_file "$file") &
-        
-        # Limit concurrent processes to avoid overwhelming the system
-        # Wait if there are too many background processes
-        while [ $(jobs -p | wc -l) -gt 8 ]; do
-            sleep 0.2
-        done
+# ─────────────────────────────────────────────────────────────
+# Stability check (same)
+is_file_stable() {
+  local f="$1"
+  local s1 s2
+  s1=$(stat -c %s -- "$f" 2>/dev/null || echo 0)
+  sleep 0.5
+  s2=$(stat -c %s -- "$f" 2>/dev/null || echo 0)
+  [[ "$s1" -ne 0 && "$s1" -eq "$s2" ]]
+}
+
+process_ready_file() {
+  local f="$1"
+  acquire_token
+  (
+    if ! is_file_stable "$f"; then
+      log_message "File not stable or removed: $f"
+      release_token
+      exit 0
+    fi
+
+    log_message "Starting upload: $f"
+    if upload_with_retries "$f"; then
+      log_message "Done upload: $f"
+    else
+      log_message "Giving up upload: $f"
+      mv -f -- "$f" "$f.failed" 2>/dev/null || true
+    fi
+    release_token
+  ) &
+}
+
+# ─────────────────────────────────────────────────────────────
+init_semaphore
+log_message "Starting fast MKV upload monitor (location=${LOCATION}, max parallel=${MAX_PARALLEL})"
+
+# inotify mode preferred
+if command -v inotifywait >/dev/null 2>&1; then
+  inotifywait -m -e close_write -e moved_to --format '%f' . | while read -r filename; do
+    case "$filename" in
+      *.mkv|*.MKV) process_ready_file "./$filename" ;;
+      *) ;;
+    esac
+  done
+else
+  log_message "inotifywait not found — polling every ${CHECK_INTERVAL}s"
+  while true; do
+    for file in ./*.mkv ./*.MKV; do
+      [[ -e "$file" ]] || continue
+      process_ready_file "$file"
     done
-    
-    # Wait for all background jobs to complete
-    wait
-    
-    # Brief pause before next scan
-    sleep $CHECK_INTERVAL
-done
+    sleep "$CHECK_INTERVAL"
+  done
+fi
+
+wait
+
+
