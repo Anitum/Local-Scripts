@@ -17,6 +17,7 @@ CHECK_INTERVAL=5  # Seconds between checks
 START_TIME=""
 END_TIME=""
 ONE_TIME_MODE=false
+CHANNELS=()  # Empty means all channels
 
 # ─────────────────────────────────────────────────────────────
 # Parse command line arguments
@@ -31,9 +32,19 @@ while [[ $# -gt 0 ]]; do
       ONE_TIME_MODE=true
       shift 2
       ;;
+    --channel)
+      # Remove brackets if present and parse comma-separated channel list
+      channel_str="$2"
+      # Strip leading/trailing brackets
+      channel_str="${channel_str#[}"
+      channel_str="${channel_str%]}"
+      # Parse comma-separated values
+      IFS=',' read -ra CHANNELS <<< "$channel_str"
+      shift 2
+      ;;
     *)
       echo "Unknown option: $1"
-      echo "Usage: $0 [--start 'YYYY-MM-DD HH:MM'] [--end 'YYYY-MM-DD HH:MM']"
+      echo "Usage: $0 [--start 'YYYY-MM-DD HH:MM'] [--end 'YYYY-MM-DD HH:MM'] [--channel '401' or --channel '401,701,301']"
       exit 1
       ;;
   esac
@@ -59,6 +70,13 @@ log "Download directory: $DOWNLOAD_DIR"
 log "S3 Bucket: $S3_BUCKET"
 log "Locations: ${LOCATIONS[*]}"
 
+# Log channel filter
+if [[ ${#CHANNELS[@]} -gt 0 ]]; then
+  log "Channel filter: ${CHANNELS[*]}"
+else
+  log "Channel filter: ALL channels"
+fi
+
 # Initialize timestamp file; if empty, start from current IST time
 if [[ ! -s "$TIMESTAMP_FILE" ]]; then
   ist_date +"%Y-%m-%d %H:%M" > "$TIMESTAMP_FILE"
@@ -79,14 +97,64 @@ else
   log "Continuous mode: will run forever"
 fi
 
-# Download one S3 key
+# Check if filename matches channel filter
+is_channel_match() {
+  local filename="$1"
+  
+  # If no channel filter specified, match all
+  if [[ ${#CHANNELS[@]} -eq 0 ]]; then
+    return 0
+  fi
+  
+  # Extract channel number from filename (e.g., channel401 from nungambakkam_channel401_20251112T123300.mkv)
+  local file_channel=$(echo "$filename" | grep -oP 'channel\K\d+' || echo "")
+  
+  if [[ -z "$file_channel" ]]; then
+    return 1  # No channel found in filename
+  fi
+  
+  # Check if file's channel is in our filter list
+  for chan in "${CHANNELS[@]}"; do
+    # Strip any whitespace from channel
+    chan=$(echo "$chan" | tr -d ' ')
+    if [[ "$file_channel" == "$chan" ]]; then
+      return 0  # Match found
+    fi
+  done
+  
+  return 1  # No match
+}
+
+# Export for use in subshells
+export -f is_channel_match
+declare -p CHANNELS > /tmp/channels_array.sh
+
+# Download one S3 key (with duplicate check)
 process_file() {
   local key="$1"
   local target_dir="$DOWNLOAD_DIR"
+  local filename=$(basename "$key")
+  
+  # Load channel array in subshell
+  source /tmp/channels_array.sh 2>/dev/null || true
+  
+  # Check channel filter
+  if ! is_channel_match "$filename"; then
+    return 0  # Skip silently
+  fi
+  
+  # Check if file already exists (skip re-download)
+  if [[ -f "$target_dir/$filename" ]]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Skipped (already exists): $filename"
+    return 0
+  fi
 
   mkdir -p "$target_dir"
-  aws s3 cp "s3://$S3_BUCKET/$key" "$target_dir/" --quiet
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] Downloaded: $key"
+  if aws s3 cp "s3://$S3_BUCKET/$key" "$target_dir/" --quiet; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Downloaded: $key"
+  else
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Failed to download: $key"
+  fi
 }
 
 export DOWNLOAD_DIR S3_BUCKET
@@ -97,16 +165,17 @@ get_hours_to_check() {
   local start_time="$1"   # "YYYY-MM-DD HH:MM"
   local end_time="$2"     # "YYYY-MM-DD HH:MM"
 
-  local start_epoch end_epoch step_epoch
-  start_epoch=$(ist_date -d "$start_time:00" +%s)
-  end_epoch=$(ist_date   -d "$end_time:00"   +%s)
+  # Extract the hour component and round down to start of hour
+  local start_hour end_hour
+  start_hour=$(ist_date -d "$start_time" '+%Y-%m-%d %H:00')
+  end_hour=$(ist_date -d "$end_time" '+%Y-%m-%d %H:00')
 
-  # Get the hour boundaries we need to check
+  # Convert to epochs for iteration
   local start_hour_epoch end_hour_epoch
-  start_hour_epoch=$(( (start_epoch / 3600) * 3600 ))
-  end_hour_epoch=$(( (end_epoch / 3600) * 3600 ))
+  start_hour_epoch=$(ist_date -d "$start_hour:00" +%s)
+  end_hour_epoch=$(ist_date -d "$end_hour:00" +%s)
 
-  step_epoch="$start_hour_epoch"
+  local step_epoch="$start_hour_epoch"
   while [[ "$step_epoch" -le "$end_hour_epoch" ]]; do
     local y m d H
     y=$(ist_date -d "@$step_epoch" +%Y)
@@ -132,22 +201,23 @@ is_file_in_range() {
     return 1  # Invalid timestamp
   fi
   
-  # Convert to comparable format: YYYY-MM-DD HH:MM
+  # Convert to comparable format: YYYY-MM-DD HH:MM:SS for better precision
   local year="${file_timestamp:0:4}"
   local month="${file_timestamp:4:2}"
   local day="${file_timestamp:6:2}"
   local hour="${file_timestamp:9:2}"
   local minute="${file_timestamp:11:2}"
+  local second="${file_timestamp:13:2}"
   
-  local file_time="${year}-${month}-${day} ${hour}:${minute}"
+  local file_time="${year}-${month}-${day} ${hour}:${minute}:${second}"
   
   # Convert times to epochs for comparison
   local file_epoch start_epoch end_epoch
-  file_epoch=$(ist_date -d "$file_time:00" +%s)
+  file_epoch=$(ist_date -d "$file_time" +%s)
   start_epoch=$(ist_date -d "$start_time:00" +%s)
-  end_epoch=$(ist_date -d "$end_time:00" +%s)
+  end_epoch=$(ist_date -d "$end_time:59" +%s)  # Include the entire end minute
   
-  # Check if file time is in range [start_time, end_time]
+  # Check if file time is in range [start_time, end_time] (inclusive)
   [[ $file_epoch -ge $start_epoch && $file_epoch -le $end_epoch ]]
 }
 
@@ -155,6 +225,21 @@ is_file_in_range() {
 extract_timestamp() {
   local filename="$1"
   echo "$filename" | grep -oP '\d{8}T\d{6}' || echo "00000000T000000"
+}
+
+# Convert extracted timestamp to readable format
+timestamp_to_readable() {
+  local ts="$1"  # Format: YYYYMMDDTHHMMss
+  if [[ ${#ts} -eq 15 ]]; then
+    local year="${ts:0:4}"
+    local month="${ts:4:2}"
+    local day="${ts:6:2}"
+    local hour="${ts:9:2}"
+    local minute="${ts:11:2}"
+    echo "${year}-${month}-${day} ${hour}:${minute}"
+  else
+    echo ""
+  fi
 }
 
 # Main loop
@@ -218,7 +303,7 @@ while true; do
         --query 'Contents[].Key' \
         --output text 2>/dev/null | tr '\t' '\n' > "$tmpf"
       
-      file_count=$(grep -c . "$tmpf" 2>/dev/null || echo 0)
+      file_count=$(wc -l < "$tmpf" 2>/dev/null || echo 0)
       log "      → $file_count files in hour"
     } &
     
@@ -242,18 +327,28 @@ while true; do
     fi
   done
 
-  total_files=$(grep -c . "$all_files" 2>/dev/null || echo 0)
+  total_files=$(wc -l < "$all_files" 2>/dev/null || echo 0)
   log "Total files found in hour prefixes: $total_files"
 
-  # Filter files to exact time range
+  # Filter files to exact time range AND channel filter
+  time_matched=0
+  channel_matched=0
   while IFS= read -r file; do
     if [[ -n "$file" ]] && is_file_in_range "$file" "$last_processed_time" "$current_time"; then
-      echo "$file" >> "$filtered_files"
+      time_matched=$((time_matched + 1))
+      # Also apply channel filter
+      if is_channel_match "$file"; then
+        echo "$file" >> "$filtered_files"
+        channel_matched=$((channel_matched + 1))
+      fi
     fi
   done < "$all_files"
 
-  filtered_count=$(grep -c . "$filtered_files" 2>/dev/null || echo 0)
-  log "Files in exact time range: $filtered_count"
+  filtered_count=$(wc -l < "$filtered_files" 2>/dev/null || echo 0)
+  log "Files in exact time range: $time_matched"
+  if [[ ${#CHANNELS[@]} -gt 0 ]]; then
+    log "After channel filter (${CHANNELS[*]}): $channel_matched"
+  fi
 
   if [[ $filtered_count -gt 0 ]]; then
     # Sort files by timestamp embedded in filename
@@ -268,23 +363,51 @@ while true; do
       fi
     done < "$filtered_files" | sort | cut -d'|' -f2 > "$sorted_files"
     
-    sorted_count=$(grep -c . "$sorted_files" 2>/dev/null || echo 0)
+    sorted_count=$(wc -l < "$sorted_files" 2>/dev/null || echo 0)
     log "Sorted $sorted_count files"
     
-    # Show first few files for verification
-    log "First 5 files to download:"
-    head -5 "$sorted_files" | while IFS= read -r file; do
+    # Show first and last few files for verification
+    log "First 3 files to process:"
+    head -3 "$sorted_files" | while IFS= read -r file; do
       ts=$(extract_timestamp "$file")
-      log "  - $file (timestamp: $ts)"
+      log "  - $(basename "$file") (ts: $ts)"
     done
     
+    if [[ $sorted_count -gt 3 ]]; then
+      log "Last 3 files to process:"
+      tail -3 "$sorted_files" | while IFS= read -r file; do
+        ts=$(extract_timestamp "$file")
+        log "  - $(basename "$file") (ts: $ts)"
+      done
+    fi
+    
     log "Starting downloads (max $MAX_PARALLEL parallel)..."
+    
+    # Process all files (process_file handles duplicate checking and logging)
     cat "$sorted_files" | xargs -I{} -P "$MAX_PARALLEL" bash -c 'process_file "$@"' _ {}
-    log "Downloads complete"
+    
+    log "Processing complete"
+    
+    # Get timestamp of the LAST file (not +1 minute, just that file's minute)
+    last_file=$(tail -1 "$sorted_files")
+    last_ts=$(extract_timestamp "$last_file")
+    latest_file_time=$(timestamp_to_readable "$last_ts")
+    
+    if [[ -n "$latest_file_time" ]]; then
+      log "Latest file timestamp: $latest_file_time"
+      
+      # DON'T add 1 minute - just use the file's timestamp
+      # The duplicate check will prevent re-downloads
+      echo "$latest_file_time" > "$TIMESTAMP_FILE"
+      log "Updated timestamp to: $latest_file_time"
+    else
+      log "Could not extract timestamp from last file, keeping current timestamp"
+    fi
     
     rm -f "$sorted_files"
   else
-    log "No files found in exact time range"
+    log "No new files found matching filters"
+    log "Keeping timestamp unchanged at: $(cat $TIMESTAMP_FILE)"
   fi
 
   # Cleanup
@@ -294,22 +417,17 @@ while true; do
   done
   unset temp_files
 
-  # Update timestamp to current time (with minutes)
+  # Exit if in one-time mode and we've processed everything up to end time
   if [[ "$ONE_TIME_MODE" == "true" ]]; then
-    echo "$END_TIME" > "$TIMESTAMP_FILE"
-  else
-    ist_date +"%Y-%m-%d %H:%M" > "$TIMESTAMP_FILE"
-  fi
-  log "Updated timestamp to: $(cat $TIMESTAMP_FILE)"
-  
-  # Exit if in one-time mode
-  if [[ "$ONE_TIME_MODE" == "true" ]]; then
-    log "One-time mode complete. Exiting."
-    exit 0
+    current_epoch=$(ist_date -d "$(cat $TIMESTAMP_FILE):00" +%s)
+    end_epoch=$(ist_date -d "$END_TIME:00" +%s)
+    if [[ $current_epoch -gt $end_epoch ]]; then
+      log "Processed beyond end time. Exiting."
+      exit 0
+    fi
   fi
   
   log ""
   log "Sleeping ${CHECK_INTERVAL}s..."
   sleep "$CHECK_INTERVAL"
 done
-
