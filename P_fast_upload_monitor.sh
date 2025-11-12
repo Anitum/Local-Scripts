@@ -4,12 +4,12 @@ set -euo pipefail
 # ─────────────────────────────────────────────────────────────
 # Config
 LOG_FILE="upload_monitor.log"
-S3_BUCKET="anitum-jk-production"   # bucket only (no trailing slash)
+S3_BUCKET="anitum-calb-production"   # bucket only (no trailing slash)
 CHECK_INTERVAL=1                   # used only in fallback polling mode
 MAX_PARALLEL=6                     # tune this to your CPU / network
 RETRY_MAX=5
 RETRY_BASE=2                       # seconds, exponential backoff base
-LOCATION="nungambakkam"
+LOCATION="kathipara"
 
 
 if [[ -z "${LOCATION}" ]]; then
@@ -107,14 +107,35 @@ upload_with_retries() {
 
 # ─────────────────────────────────────────────────────────────
 # Stability check (same)
+
+
+
 is_file_stable() {
   local f="$1"
+  [[ ! -f "$f" ]] && return 1
+
+  # Check if file is open (most reliable check)
+  if command -v lsof >/dev/null 2>&1; then
+    lsof "$f" >/dev/null 2>&1 && return 1
+  fi
+
+  # File age check - must be at least 5 seconds old
+  local file_mod_time=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+  local current_time=$(date +%s)
+  local age=$((current_time - file_mod_time))
+  [[ $age -lt 5 ]] && return 1
+
+  # Size stability - check twice with 2-second gap
   local s1 s2
   s1=$(stat -c %s -- "$f" 2>/dev/null || echo 0)
-  sleep 0.5
+  [[ "$s1" -eq 0 ]] && return 1
+
+  sleep 2
   s2=$(stat -c %s -- "$f" 2>/dev/null || echo 0)
-  [[ "$s1" -ne 0 && "$s1" -eq "$s2" ]]
+  [[ "$s1" -eq "$s2" ]]
 }
+
+
 
 process_ready_file() {
   local f="$1"
@@ -161,5 +182,4 @@ else
 fi
 
 wait
-
 
