@@ -1,0 +1,1137 @@
+# S3 Video Downloader - Complete Documentation
+
+## Table of Contents
+1. [Overview](#overview)
+2. [One-Time Downloader](#one-time-downloader)
+3. [Continuous Downloader](#continuous-downloader)
+4. [Common Features](#common-features)
+5. [Troubleshooting](#troubleshooting)
+
+---
+
+## Overview
+
+These scripts download video files from AWS S3 buckets organized in a time-based directory structure:
+```
+s3://bucket/location/YYYY/MM/DD/HH/filename.mp4
+```
+
+**Two Scripts:**
+- **`downloader.sh`** - One-time historical downloads
+- **`continuous_downloader.sh`** - Real-time continuous downloads
+
+---
+
+# One-Time Downloader
+
+## Purpose
+
+Downloads files from S3 for a specific time range and exits. Perfect for:
+- Backfilling historical data
+- Downloading specific time periods
+- One-off data retrieval
+
+## Features
+
+✅ **Flexible Time Ranges**
+- Start to end time
+- Start to current time
+- Beginning to end time
+
+✅ **Smart Processing**
+- Lists hour-by-hour directories
+- Sorts files chronologically before downloading
+- Parallel listing and downloading (streams via FIFO)
+
+✅ **Performance**
+- Configurable parallel downloads (default: 10)
+- No duplicate checking (downloads everything)
+- No state tracking (stateless execution)
+
+✅ **Filtering**
+- Filter by channel numbers
+- Time-range precision (minute-level)
+
+---
+
+## Installation
+
+### Requirements
+
+```bash
+# AWS CLI v2
+aws --version
+
+# Bash 4+
+bash --version
+
+# Standard Unix tools
+which mktemp xargs
+```
+
+### Setup
+
+```bash
+# 1. Save script
+chmod +x downloader.sh
+
+# 2. Configure AWS credentials
+aws configure
+# OR
+export AWS_ACCESS_KEY_ID="your-key"
+export AWS_SECRET_ACCESS_KEY="your-secret"
+export AWS_DEFAULT_REGION="us-east-1"
+
+# 3. Test connection
+aws s3 ls s3://anitum-jk-production/nungambakkam/ --max-items 5
+```
+
+---
+
+## Configuration
+
+Edit these variables at the top of the script:
+
+```bash
+DOWNLOAD_DIR="./P_downloaded"      # Where files are saved
+S3_BUCKET="anitum-jk-production"   # S3 bucket name
+LOCATION="nungambakkam"            # Location prefix
+MAX_PARALLEL=10                     # Parallel downloads
+```
+
+---
+
+## Usage
+
+### Basic Examples
+
+```bash
+# 1. Download specific time range
+./downloader.sh --start "2025-11-07 10:25" --end "2025-11-07 11:30"
+
+# 2. Download from start to now
+./downloader.sh --start "2025-11-07 10:25"
+
+# 3. Download everything up to end time
+./downloader.sh --end "2025-11-07 11:30"
+
+# 4. Download specific channels only
+./downloader.sh \
+  --start "2025-11-07 10:00" \
+  --end "2025-11-07 12:00" \
+  --channel "401,701"
+
+# 5. Single channel
+./downloader.sh --start "2025-11-07 10:00" --channel "401"
+```
+
+### Time Format
+
+```
+YYYY-MM-DD HH:MM
+│    │  │  │  │
+│    │  │  │  └─ Minutes (00-59)
+│    │  │  └──── Hours (00-23, IST timezone)
+│    │  └─────── Day (01-31)
+│    └────────── Month (01-12)
+└─────────────── Year (4 digits)
+
+Examples:
+  2025-11-07 10:25  ✓
+  2025-11-07 09:00  ✓
+  2025-1-7 9:0      ✗ (must be zero-padded)
+```
+
+### Channel Format
+
+```bash
+# Single channel
+--channel "401"
+
+# Multiple channels (comma-separated)
+--channel "401,701,301"
+
+# With brackets (optional)
+--channel "[401,701]"
+
+# All channels (omit flag)
+./downloader.sh --start "..." --end "..."
+```
+
+---
+
+## How It Works
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│ 1. Parse Arguments                                  │
+│    --start, --end, --channel                        │
+└─────────────┬───────────────────────────────────────┘
+              ▼
+┌─────────────────────────────────────────────────────┐
+│ 2. Generate Hour Prefixes                           │
+│    2025/11/07/10/ → 2025/11/07/11/ → ...           │
+└─────────────┬───────────────────────────────────────┘
+              ▼
+┌─────────────────────────────────────────────────────┐
+│ 3. List S3 (Parallel)                               │
+│    aws s3api list-objects-v2 (multiple prefixes)    │
+└─────────────┬───────────────────────────────────────┘
+              ▼
+┌─────────────────────────────────────────────────────┐
+│ 4. Filter Files                                     │
+│    • Time range check                               │
+│    • Channel match                                  │
+└─────────────┬───────────────────────────────────────┘
+              ▼
+┌─────────────────────────────────────────────────────┐
+│ 5. Sort Chronologically                             │
+│    Extract timestamp → sort → remove timestamp      │
+└─────────────┬───────────────────────────────────────┘
+              ▼
+┌─────────────────────────────────────────────────────┐
+│ 6. Download (Parallel via FIFO)                     │
+│    Stream files to workers via named pipe           │
+└─────────────┬───────────────────────────────────────┘
+              ▼
+┌─────────────────────────────────────────────────────┐
+│ 7. Exit                                             │
+└─────────────────────────────────────────────────────┘
+```
+
+### Parallel Processing
+
+```bash
+# Listing and downloading happen simultaneously
+
+[Lister Thread]                [Downloader Workers]
+     │                               │
+     ├─ List hour 1 ────────────────→ Worker 1: Download file A
+     │                               │
+     ├─ List hour 2 ────────────────→ Worker 2: Download file B
+     │                               │
+     ├─ List hour 3 ────────────────→ Worker 3: Download file C
+     │                               │
+     └─ List hour N ────────────────→ ... (up to MAX_PARALLEL)
+```
+
+### File Filtering Logic
+
+```bash
+filename: "channel401_20251107T102530.mp4"
+                     ^^^^^^^^^^^^^^^^
+                     Extracted timestamp
+
+Time check:
+  file_time: 2025-11-07 10:25:30
+  start:     2025-11-07 10:25:00  ✓ (file >= start)
+  end:       2025-11-07 11:30:59  ✓ (file <= end)
+
+Channel check:
+  file_channel: "401"
+  allowed:      ["401", "701"]    ✓ (match found)
+
+Result: DOWNLOAD ✓
+```
+
+---
+
+## Output
+
+### Console Output
+
+```
+[2025-11-14 19:00:00] ═══════════════════════════════════════════════════════════
+[2025-11-14 19:00:00] S3 Downloader Started
+[2025-11-14 19:00:00] Bucket: anitum-jk-production
+[2025-11-14 19:00:00] Location: nungambakkam
+[2025-11-14 19:00:00] Start: 2025-11-07 10:25
+[2025-11-14 19:00:00] End: 2025-11-07 11:30
+[2025-11-14 19:00:00] Channels: 401,701
+[2025-11-14 19:00:00] Download dir: ./P_downloaded
+[2025-11-14 19:00:00] ═══════════════════════════════════════════════════════════
+[2025-11-14 19:00:00] Processing 2 hour directories
+[2025-11-14 19:00:01] Listing: s3://anitum-jk-production/nungambakkam/2025/11/07/10/
+[2025-11-14 19:00:01] Listing: s3://anitum-jk-production/nungambakkam/2025/11/07/11/
+[2025-11-14 19:00:05] ✓ channel401_20251107T102530.mp4
+[2025-11-14 19:00:06] ✓ channel401_20251107T103000.mp4
+[2025-11-14 19:00:06] ✓ channel701_20251107T102530.mp4
+[2025-11-14 19:00:07] ✗ channel401_20251107T110000.mp4
+[2025-11-14 19:00:10] ═══════════════════════════════════════════════════════════
+[2025-11-14 19:00:10] Download complete!
+[2025-11-14 19:00:10] ═══════════════════════════════════════════════════════════
+```
+
+### File Structure
+
+```
+./P_downloaded/
+├── channel401_20251107T102530.mp4
+├── channel401_20251107T103000.mp4
+├── channel401_20251107T103030.mp4
+├── channel701_20251107T102530.mp4
+└── channel701_20251107T103000.mp4
+```
+
+---
+
+## Performance Tips
+
+### 1. Adjust Parallelism
+
+```bash
+# Edit script
+MAX_PARALLEL=20  # More workers for faster downloads
+
+# Trade-offs:
+# More workers = Faster but more CPU/network
+# Fewer workers = Slower but more stable
+```
+
+### 2. Network Optimization
+
+```bash
+# Use EC2 instance in same region as S3
+# Enable S3 Transfer Acceleration (if available)
+aws configure set default.s3.max_concurrent_requests 20
+```
+
+### 3. Large Time Ranges
+
+```bash
+# Break into smaller chunks
+./downloader.sh --start "2025-11-01 00:00" --end "2025-11-01 23:59"
+./downloader.sh --start "2025-11-02 00:00" --end "2025-11-02 23:59"
+# ... etc
+```
+
+---
+
+## Limitations
+
+❌ **No duplicate detection** - Downloads everything (no check for existing files)
+❌ **No resume** - Starts fresh each time
+❌ **Memory usage** - Loads all file keys into memory before sorting
+❌ **No progress bar** - Only shows individual file completion
+
+---
+
+# Continuous Downloader
+
+## Purpose
+
+Monitors S3 in real-time and downloads new files as they arrive. Perfect for:
+- Live video ingestion
+- Real-time data pipelines
+- Continuous monitoring
+
+## Features
+
+✅ **Auto-Discovery**
+- Automatically finds latest year/month/day/hour
+- Auto-advances to next hour when available
+- Handles day/month/year transitions
+
+✅ **Smart Monitoring**
+- Configurable check interval (default: 90s)
+- Lookback window for late arrivals
+- Tracks download history (independent of filesystem)
+
+✅ **Robust Tracking**
+- Persistent history file (`.download_history.txt`)
+- Works even if files are moved/deleted
+- Thread-safe with file locking
+
+✅ **Continuous Operation**
+- Runs indefinitely
+- Auto-recovery from errors
+- Graceful hour transitions
+
+---
+
+## Installation
+
+Same as one-time downloader, plus:
+
+```bash
+# Ensure flock is available (for thread-safe history)
+which flock
+```
+
+---
+
+## Configuration
+
+```bash
+DOWNLOAD_DIR="./P_downloaded"         # Download destination
+S3_BUCKET="anitum-jk-production"      # S3 bucket
+LOCATION="nungambakkam"               # Location prefix
+MAX_PARALLEL=10                        # Parallel downloads
+CHECK_INTERVAL=90                      # Seconds between checks
+LOOKBACK_FILES=20                      # Recent files window
+DOWNLOAD_HISTORY=".download_history.txt"  # History file
+```
+
+---
+
+## Usage
+
+### Basic Examples
+
+```bash
+# 1. Start continuous download (all channels)
+./continuous_downloader.sh
+
+# 2. Specific channels
+./continuous_downloader.sh --channel "401,701"
+
+# 3. Custom check interval
+./continuous_downloader.sh --interval 60
+
+# 4. Custom lookback window
+./continuous_downloader.sh --lookback 30
+
+# 5. Combined
+./continuous_downloader.sh \
+  --channel "401" \
+  --interval 120 \
+  --lookback 25
+```
+
+### Running as Background Service
+
+```bash
+# 1. Using nohup
+nohup ./continuous_downloader.sh > downloader.log 2>&1 &
+echo $! > downloader.pid
+
+# 2. Using screen
+screen -S downloader
+./continuous_downloader.sh
+# Press Ctrl+A, D to detach
+
+# 3. Using systemd (create service file)
+sudo nano /etc/systemd/system/s3-downloader.service
+```
+
+**systemd service file:**
+
+```ini
+[Unit]
+Description=S3 Continuous Downloader
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/testing_download
+ExecStart=/home/ubuntu/testing_download/continuous_downloader.sh --channel "401,701"
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/s3-downloader.log
+StandardError=append:/var/log/s3-downloader-error.log
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+# Enable and start
+sudo systemctl daemon-reload
+sudo systemctl enable s3-downloader
+sudo systemctl start s3-downloader
+
+# Check status
+sudo systemctl status s3-downloader
+
+# View logs
+sudo journalctl -u s3-downloader -f
+```
+
+---
+
+## How It Works
+
+### Startup Process
+
+```
+┌─────────────────────────────────────────────────────┐
+│ 1. Initialize                                       │
+│    • Create download directory                      │
+│    • Load/create history file                       │
+└─────────────┬───────────────────────────────────────┘
+              ▼
+┌─────────────────────────────────────────────────────┐
+│ 2. Auto-Discovery                                   │
+│    • Find most recent year                          │
+│    • Find most recent month                         │
+│    • Find most recent day                           │
+│    • Find most recent hour                          │
+└─────────────┬───────────────────────────────────────┘
+              ▼
+┌─────────────────────────────────────────────────────┐
+│ 3. Enter Main Loop                                  │
+└─────────────────────────────────────────────────────┘
+```
+
+### Main Loop (Each Cycle)
+
+```
+┌─────────────────────────────────────────────────────┐
+│ 1. Query S3 for Recent Files                        │
+│    aws s3api list-objects-v2                        │
+│    --query "reverse(sort_by(..., &LastModified))"  │
+└─────────────┬───────────────────────────────────────┘
+              ▼
+┌─────────────────────────────────────────────────────┐
+│ 2. Filter Files                                     │
+│    • Check download history                         │
+│    • Check channel match                            │
+└─────────────┬───────────────────────────────────────┘
+              ▼
+┌─────────────────────────────────────────────────────┐
+│ 3. Download New Files (Parallel)                    │
+│    • Sort by timestamp                              │
+│    • Download with xargs -P                         │
+│    • Mark in history                                │
+└─────────────┬───────────────────────────────────────┘
+              ▼
+┌─────────────────────────────────────────────────────┐
+│ 4. Check for Next Hour                              │
+│    • Calculate next hour timestamp                  │
+│    • Check if directory exists in S3                │
+│    • Auto-advance if available                      │
+└─────────────┬───────────────────────────────────────┘
+              ▼
+┌─────────────────────────────────────────────────────┐
+│ 5. Sleep (CHECK_INTERVAL seconds)                   │
+└─────────────┬───────────────────────────────────────┘
+              │
+              └───────────────► Loop back to step 1
+```
+
+### Hour Transition Logic
+
+```
+Current: 2025-11-07 23:00
+
+Check next hour:
+  next_epoch = current + 1 hour
+  next = 2025-11-08 00:00  (auto-handles day/month/year change)
+
+Query S3:
+  aws s3 ls s3://bucket/location/2025/11/08/
+  Look for: "PRE 00/"
+
+If found:
+  ✅ Move to 2025-11-08 00:00
+Else:
+  ⏸️  Stay at 2025-11-07 23:00
+```
+
+### Lookback Window
+
+```
+S3 Hour Directory: 19:00 - 19:59
+Total files: 120
+
+Lookback window: 20 files
+  ┌───────────────────────────────────┐
+  │ Most recent 20 files by           │
+  │ LastModified timestamp            │
+  └───────────────────────────────────┘
+         ▼
+  • 19:55:30 ← Newest
+  • 19:55:00
+  • 19:54:30
+  • ...
+  • 19:45:30 ← Oldest in window
+
+Why lookback?
+  • Catches late-arriving files
+  • Handles out-of-order uploads
+  • Balances thoroughness vs. efficiency
+```
+
+---
+
+## Download History
+
+### Format
+
+```bash
+# .download_history.txt
+nungambakkam/2025/11/14/19/channel401_20251114T190000.mp4
+nungambakkam/2025/11/14/19/channel401_20251114T190030.mp4
+nungambakkam/2025/11/14/19/channel701_20251114T190000.mp4
+```
+
+Each line is the full S3 key (one file per line)
+
+### Thread Safety
+
+```bash
+# Multiple workers downloading in parallel
+Worker 1: Downloading file A
+  ├─ flock -x 200  (acquire lock)
+  ├─ echo "key" >> history
+  └─ Release lock
+
+Worker 2: Downloading file B (waits)
+  ├─ flock -x 200  (waits for lock)
+  ├─ echo "key" >> history
+  └─ Release lock
+```
+
+### Management
+
+```bash
+# View history
+cat .download_history.txt
+
+# Count downloaded files
+wc -l .download_history.txt
+
+# Find specific file
+grep "channel401_20251114T190000" .download_history.txt
+
+# Clear history (forces re-download)
+rm .download_history.txt
+
+# Backup history
+cp .download_history.txt .download_history.backup.txt
+
+# Remove duplicates (if any)
+sort -u .download_history.txt -o .download_history.txt
+```
+
+---
+
+## Output
+
+### Console Output (Continuous)
+
+```
+[2025-11-14 19:00:00] ═══════════════════════════════════════════════════════════
+[2025-11-14 19:00:00] 🔄 Continuous S3 Downloader Started
+[2025-11-14 19:00:00] Bucket: anitum-jk-production
+[2025-11-14 19:00:00] Location: nungambakkam
+[2025-11-14 19:00:00] Channels: 401,701
+[2025-11-14 19:00:00] Check interval: 90s
+[2025-11-14 19:00:00] Lookback window: 20 files
+[2025-11-14 19:00:00] Download dir: ./P_downloaded
+[2025-11-14 19:00:00] History file: .download_history.txt (1234 files tracked)
+[2025-11-14 19:00:00] ═══════════════════════════════════════════════════════════
+[2025-11-14 19:00:00] 🔍 Discovering current S3 location...
+[2025-11-14 19:00:01]   Year: 2025
+[2025-11-14 19:00:02]   Month: 11
+[2025-11-14 19:00:03]   Day: 14
+[2025-11-14 19:00:04]   Hour: 19
+[2025-11-14 19:00:04] ✅ Starting from: 2025-11-14 19:00
+[2025-11-14 19:00:04] 
+[2025-11-14 19:00:04] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[2025-11-14 19:00:04] 🔄 Cycle #1
+[2025-11-14 19:00:04] 📍 Current: 2025-11-14 19:00
+[2025-11-14 19:00:04] 📥 Checking: s3://anitum-jk-production/nungambakkam/2025/11/14/19/
+[2025-11-14 19:00:05]   Found 20 recent files (lookback window: 20)
+[2025-11-14 19:00:05]   Skipped: 18 (already downloaded)
+[2025-11-14 19:00:05]   New: 2
+[2025-11-14 19:00:06] ✓ channel401_20251114T190530.mp4
+[2025-11-14 19:00:07] ✓ channel701_20251114T190530.mp4
+[2025-11-14 19:00:07] ⏸️  Staying at current hour (next hour not ready yet)
+[2025-11-14 19:00:07] 
+[2025-11-14 19:00:07] 😴 Sleeping for 90 seconds...
+[2025-11-14 19:00:07] 
+[2025-11-14 19:01:37] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[2025-11-14 19:01:37] 🔄 Cycle #2
+[2025-11-14 19:01:37] 📍 Current: 2025-11-14 19:00
+...
+[2025-11-14 20:00:05] ⏭️  Next hour detected: 2025-11-14 20:00
+[2025-11-14 20:00:05] ✅ Moved to: 2025-11-14 20:00
+```
+
+---
+
+## Tuning Parameters
+
+### Check Interval
+
+```bash
+CHECK_INTERVAL=90  # seconds
+
+# Guidelines:
+30-60s   → High-frequency (near real-time)
+90-120s  → Balanced (recommended)
+180-300s → Low-frequency (batch-like)
+
+# Consider:
+• File arrival frequency
+• S3 API rate limits
+• Network bandwidth
+```
+
+### Lookback Window
+
+```bash
+LOOKBACK_FILES=20
+
+# Guidelines:
+10-15  → Fast uploads, reliable timing
+20-25  → Recommended for most cases
+30-50  → Unreliable uploads, lots of stragglers
+
+# Trade-offs:
+Smaller → Faster checks, may miss late files
+Larger  → More API calls, catches more stragglers
+```
+
+### Parallel Downloads
+
+```bash
+MAX_PARALLEL=10
+
+# Guidelines:
+5-10   → Conservative (stable)
+10-20  → Aggressive (fast)
+20+    → Very aggressive (may hit limits)
+
+# Factors:
+• Network bandwidth
+• CPU cores
+• S3 API limits
+• Disk I/O
+```
+
+---
+
+## Monitoring
+
+### Health Checks
+
+```bash
+# Check if running
+ps aux | grep continuous_downloader
+
+# Monitor in real-time
+tail -f /var/log/s3-downloader.log
+
+# Check download rate
+watch -n 5 'ls -1 ./P_downloaded | wc -l'
+
+# Check history growth
+watch -n 10 'wc -l .download_history.txt'
+```
+
+### Metrics to Track
+
+```bash
+# Files per hour
+grep "✓" /var/log/s3-downloader.log | wc -l
+
+# Skip rate (efficiency)
+grep "Skipped:" /var/log/s3-downloader.log | tail -20
+
+# Hour transitions
+grep "Moved to:" /var/log/s3-downloader.log
+
+# Errors
+grep "✗" /var/log/s3-downloader.log
+grep "Failed" /var/log/s3-downloader.log
+```
+
+---
+
+## Common Features (Both Scripts)
+
+### Timezone
+
+Both scripts use **IST (Indian Standard Time)** internally:
+
+```bash
+ist_date() {
+  TZ="Asia/Kolkata" date "$@"
+}
+
+# All timestamps are in IST
+# Files are matched using IST
+# Hour directories are processed in IST
+```
+
+### Channel Filtering
+
+```bash
+# Filename pattern
+channel401_20251114T190530.mp4
+^^^^^^^
+Channel number extracted with regex: 'channel\K\d+'
+
+# Matching logic
+is_channel_match() {
+  local filename="$1"
+  [[ ${#CHANNELS[@]} -eq 0 ]] && return 0  # No filter = all pass
+  
+  local file_channel=$(echo "$filename" | grep -oP 'channel\K\d+')
+  
+  for chan in "${CHANNELS[@]}"; do
+    [[ "$file_channel" == "$chan" ]] && return 0
+  done
+  
+  return 1  # No match
+}
+```
+
+### Error Handling
+
+```bash
+set -euo pipefail
+
+# -e: Exit on error
+# -u: Exit on undefined variable
+# -o pipefail: Exit on pipe failures
+
+# Safe command substitution
+result=$(command 2>/dev/null || echo "")
+[[ -z "$result" ]] && { handle_error; }
+```
+
+---
+
+## Troubleshooting
+
+### Problem: No files downloaded
+
+```bash
+# Check 1: AWS credentials
+aws s3 ls s3://anitum-jk-production/nungambakkam/ --max-items 5
+
+# Check 2: Time range
+# Ensure files exist for your specified time
+
+# Check 3: Channel filter
+# Try without --channel flag first
+
+# Check 4: Permissions
+ls -la ./P_downloaded
+chmod 755 ./P_downloaded
+```
+
+### Problem: Script exits immediately
+
+```bash
+# Check logs for errors
+./downloader.sh 2>&1 | tee debug.log
+
+# Common causes:
+# • Invalid time format
+# • No matching files
+# • AWS credential issues
+# • Network connectivity
+```
+
+### Problem: Slow downloads
+
+```bash
+# Check 1: Network speed
+wget -O /dev/null http://speedtest.tele2.net/10MB.zip
+
+# Check 2: Increase parallelism
+MAX_PARALLEL=20
+
+# Check 3: EC2 placement
+# Use instance in same region as S3
+
+# Check 4: Instance type
+# Ensure adequate network bandwidth
+```
+
+### Problem: Missing files (continuous mode)
+
+```bash
+# Check 1: Lookback window too small
+./continuous_downloader.sh --lookback 30
+
+# Check 2: Check interval too long
+./continuous_downloader.sh --interval 60
+
+# Check 3: Review history
+grep "Skipped:" /var/log/s3-downloader.log
+
+# Check 4: Verify S3 upload timing
+aws s3api list-objects-v2 \
+  --bucket anitum-jk-production \
+  --prefix "nungambakkam/2025/11/14/19/" \
+  --query "Contents[].[Key,LastModified]" \
+  --output table
+```
+
+### Problem: Duplicate downloads
+
+```bash
+# One-time downloader: Expected (no duplicate check)
+# Continuous downloader: Should not happen
+
+# If it happens:
+# Check 1: History file corrupted
+sort -u .download_history.txt -o .download_history.txt
+
+# Check 2: Multiple instances running
+ps aux | grep continuous_downloader
+# Kill duplicates
+
+# Check 3: History file permissions
+ls -la .download_history.txt
+chmod 644 .download_history.txt
+```
+
+### Problem: Out of disk space
+
+```bash
+# Check space
+df -h ./P_downloaded
+
+# Solution 1: Move files after download
+# (history tracking handles this)
+
+# Solution 2: Add auto-cleanup
+find ./P_downloaded -type f -mtime +7 -delete
+
+# Solution 3: External processing
+rsync -av --remove-source-files ./P_downloaded/ /mnt/storage/
+```
+
+---
+
+## Best Practices
+
+### 1. Use Screen/Systemd for Continuous Mode
+
+```bash
+# Don't: SSH session dependency
+./continuous_downloader.sh
+
+# Do: Background service
+systemctl start s3-downloader
+```
+
+### 2. Monitor Disk Space
+
+```bash
+# Add to crontab
+*/5 * * * * df -h /home/ubuntu/testing_download | mail -s "Disk Space" admin@example.com
+```
+
+### 3. Rotate Logs
+
+```bash
+# /etc/logrotate.d/s3-downloader
+/var/log/s3-downloader.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    notifempty
+    missingok
+}
+```
+
+### 4. Backup History File
+
+```bash
+# Cron job
+0 0 * * * cp /home/ubuntu/testing_download/.download_history.txt /backup/download_history_$(date +\%Y\%m\%d).txt
+```
+
+### 5. Use IAM Roles (EC2)
+
+```bash
+# Don't: Hardcode credentials
+AWS_ACCESS_KEY_ID=...
+
+# Do: IAM instance role
+# No credentials needed in script
+```
+
+### 6. Test with Small Time Ranges
+
+```bash
+# Don't: Start with months of data
+./downloader.sh --start "2025-01-01 00:00" --end "2025-12-31 23:59"
+
+# Do: Test with hours first
+./downloader.sh --start "2025-11-14 19:00" --end "2025-11-14 20:00"
+```
+
+---
+
+## Advanced Usage
+
+### Running Multiple Instances
+
+```bash
+# Different channels per instance
+./continuous_downloader.sh --channel "401" &
+./continuous_downloader.sh --channel "701" &
+./continuous_downloader.sh --channel "301" &
+
+# Note: Use separate history files
+DOWNLOAD_HISTORY=".download_history_401.txt" ./continuous_downloader.sh --channel "401"
+```
+
+### Chaining with Processing
+
+```bash
+# Download → Process pipeline
+./continuous_downloader.sh | while read line; do
+  if [[ "$line" =~ "✓ " ]]; then
+    filename=$(echo "$line" | awk '{print $3}')
+    ./process_video.sh "./P_downloaded/$filename"
+  fi
+done
+```
+
+### S3 Event Integration
+
+```bash
+# Alternative: Use S3 event notifications
+# → SQS → Lambda → Download
+# More reliable for production
+```
+
+---
+
+## File Naming Convention
+
+### Expected Format
+
+```
+channel<NUM>_<TIMESTAMP>.mp4
+│       │    │           │
+│       │    │           └─ Extension
+│       │    └───────────── YYYYMMDDTHHmmss
+│       └────────────────── Channel number
+└────────────────────────── Literal "channel"
+
+Examples:
+✓ channel401_20251114T190530.mp4
+✓ channel1_20251114T000000.mp4
+✓ channel9999_20251231T235959.mp4
+
+✗ 401_20251114T190530.mp4        (missing "channel")
+✗ channel401-20251114T190530.mp4 (wrong separator)
+✗ channel401_2025-11-14.mp4      (wrong timestamp format)
+```
+
+---
+
+## Performance Benchmarks
+
+### One-Time Downloader
+
+```
+Time Range: 1 hour (120 files, 5GB total)
+Instance: t3.medium (2 vCPU, 4GB RAM)
+Network: 5 Gbps
+
+MAX_PARALLEL=5   → 180 seconds
+MAX_PARALLEL=10  → 95 seconds
+MAX_PARALLEL=20  → 55 seconds
+MAX_PARALLEL=50  → 45 seconds (diminishing returns)
+```
+
+### Continuous Downloader
+
+```
+File arrival: 1 file/30 seconds per channel
+Channels: 3
+Check interval: 90s
+Lookback: 20 files
+
+CPU usage: ~2-5%
+Memory: ~50MB
+Network: Bursts to 100 Mbps during downloads
+Latency: 30-90 seconds from upload to download complete
+```
+
+---
+
+## Support and Maintenance
+
+### Logging Improvements
+
+```bash
+# Add timestamp to every line
+exec > >(ts '[%Y-%m-%d %H:%M:%S]' | tee -a full.log)
+exec 2>&1
+
+# Structured logging (JSON)
+log() {
+  echo "{\"timestamp\":\"$(date -Iseconds)\",\"level\":\"INFO\",\"message\":\"$*\"}"
+}
+```
+
+### Health Check Endpoint
+
+```bash
+# Add to continuous downloader
+echo "$(date -Iseconds)" > /tmp/downloader_heartbeat
+
+# Monitor externally
+if [[ $(find /tmp/downloader_heartbeat -mmin +5) ]]; then
+  echo "Downloader might be stuck!"
+fi
+```
+
+---
+
+## Security Considerations
+
+1. **IAM Permissions** (Minimal):
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket"
+      ],
+      "Resource": "arn:aws:s3:::anitum-jk-production"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject"
+      ],
+      "Resource": "arn:aws:s3:::anitum-jk-production/nungambakkam/*"
+    }
+  ]
+}
+```
+
+2. **File Permissions**:
+```bash
+chmod 600 .download_history.txt
+chmod 700 downloader.sh continuous_downloader.sh
+```
+
+3. **Network Security**:
+```bash
+# EC2 security group: No inbound rules needed
+# Outbound: HTTPS (443) to S3 endpoints only
+```
+
+---
+
+## License and Credits
+
+```
+Script: S3 Video Downloader
+Version: 1.0
+Author: Custom developed
+License: MIT
+Dependencies: AWS CLI, Bash 4+, standard Unix tools
+```
+
+---
