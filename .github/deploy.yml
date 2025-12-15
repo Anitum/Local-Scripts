@@ -9,12 +9,12 @@ jobs:
     runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
-
-      - name: Run nmap discovery
-        run: sudo ./P_nmap.sh
-
+      
       - name: Set RTSP credentials
         run: echo "Using brand1-loc1 creds"
+
+      - name: Run nmap discovery
+        run: sudo -E ./P_nmap.sh
         env:
           RTSP_USER: ${{ secrets.RTSP_USER_BRAND1_LOC1 }}
           RTSP_PASS: ${{ secrets.RTSP_PASS_BRAND1_LOC1 }}
