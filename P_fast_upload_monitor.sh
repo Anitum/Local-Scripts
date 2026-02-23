@@ -20,6 +20,8 @@ fi
 
 # Ensure AWS CLI configured and in PATH
 command -v aws >/dev/null || { echo "aws CLI not found"; exit 1; }
+# added to make sure it chooses IPv6 when available and if not, IPv4 is chosen
+export AWS_S3_USE_DUALSTACK_ENDPOINT=true
 
 log_message() {
   echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
