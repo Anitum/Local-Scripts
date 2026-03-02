@@ -70,17 +70,8 @@ while true; do
     ping -c 3 google.com >> "$LOG_FILE" 2>&1
     ping -c 2 -W 2 8.8.8.8 >> "$LOG_FILE" 2>&1
 
-    # log "--- Internet speed ---"
-    # timeout 20 speedtest-cli --simple >> "$LOG_FILE" 2>&1 || log "speedtest timed out"
-    # I have made a change here to make sure the speed test runs once in 10 mins..
-    
-    CURRENT_TIME=$(date +%s)
-
-    if (( CURRENT_TIME - LAST_SPEEDTEST >= SPEEDTEST_INTERVAL )); then
-        log "--- Internet speed ---"
-        timeout 20 speedtest-cli --simple >> "$LOG_FILE" 2>&1 || log "speedtest timed out"
-        LAST_SPEEDTEST=$CURRENT_TIME
-    fi
+    log "--- Internet speed ---"
+    timeout 20 speedtest-cli --simple >> "$LOG_FILE" 2>&1 || log "speedtest timed out"
 
     log "--- CPU usage ---"
     top -bn1 | grep "Cpu(s)" >> "$LOG_FILE"
