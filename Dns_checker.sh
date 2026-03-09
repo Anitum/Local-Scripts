@@ -121,10 +121,8 @@ echo "Done"
 
 # Start DNS supervisor loop (runs indefinitely)
 
-(
-    while true; do
-        dns_guard
-        sleep 50   # small sleep to reduce CPU usage
-    done
-) &
+while true; do
+    dns_guard
+    sleep 50   # small sleep to reduce CPU usage
+done
 
