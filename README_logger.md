@@ -38,13 +38,13 @@ System services should run from a stable system path.
 Move the script to:
 
 ```bash
-sudo mv logger.sh network-monitor.sh
+sudo mv logger.sh /usr/bin/network-monitor.sh
 ```
 
 Verify:
 
 ```bash
-ls  network-monitor.sh
+ls  /usr/bin/network-monitor.sh
 ```
 
 ---
