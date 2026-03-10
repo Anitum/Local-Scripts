@@ -163,13 +163,13 @@ If the script writes logs, use a dedicated directory.
 Example:
 
 ```bash
-sudo mkdir -p /network-monitor
+sudo mkdir -p /network_monitor
 ```
 
 Update your script to write logs there:
 
 ```
-LOG_DIR="/network-monitor"
+LOG_DIR="/network_monitor"
 ```
 
 ---
