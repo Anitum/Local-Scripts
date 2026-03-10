@@ -61,14 +61,16 @@ Add the following configuration:
 
 ```ini
 [Unit]
-Description=Network Monitoring Service
+Description=Network Monitor Service
 After=network.target
 
 [Service]
-ExecStart=network-monitor.sh
+Type=simple
+ExecStart=/bin/network-monitor.sh
 Restart=always
 RestartSec=5
-User=root
+User=anitum
+WorkingDirectory=/home/anitum
 
 [Install]
 WantedBy=multi-user.target
