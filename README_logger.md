@@ -38,13 +38,13 @@ System services should run from a stable system path.
 Move the script to:
 
 ```bash
-sudo mv logger.sh /usr/local/bin/logger.sh
+sudo mv logger.sh network-monitor.sh
 ```
 
 Verify:
 
 ```bash
-ls /usr/local/bin/logger.sh
+ls  network-monitor.sh
 ```
 
 ---
@@ -54,18 +54,18 @@ ls /usr/local/bin/logger.sh
 Create a new service definition.
 
 ```bash
-sudo nano /etc/systemd/system/logger.service
+sudo nano /etc/systemd/system/network-monitor.service
 ```
 
 Add the following configuration:
 
 ```ini
 [Unit]
-Description=Logger Monitoring Service
+Description=Network Monitoring Service
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/logger.sh
+ExecStart=network-monitor.sh
 Restart=always
 RestartSec=5
 User=root
@@ -93,7 +93,7 @@ sudo systemctl daemon-reload
 Start the logger service manually.
 
 ```bash
-sudo systemctl start logger.service
+sudo systemctl start network-monitor.service
 ```
 
 ---
@@ -103,7 +103,7 @@ sudo systemctl start logger.service
 Enable the service so it runs automatically when the system starts.
 
 ```bash
-sudo systemctl enable logger.service
+sudo systemctl enable network-monitor.service
 ```
 
 ---
@@ -113,7 +113,7 @@ sudo systemctl enable logger.service
 Verify the service is running.
 
 ```bash
-sudo systemctl status logger.service
+sudo systemctl status network-monitor.service
 ```
 
 Expected output should contain:
@@ -129,13 +129,13 @@ Active: active (running)
 To view logs produced by the service:
 
 ```bash
-journalctl -u logger.service
+journalctl -u network-monitor.service
 ```
 
 To follow logs in real time:
 
 ```bash
-journalctl -u logger.service -f
+journalctl -u network-monitor.service -f
 ```
 
 ---
@@ -145,13 +145,13 @@ journalctl -u logger.service -f
 Stop the service:
 
 ```bash
-sudo systemctl stop logger.service
+sudo systemctl stop network-monitor.service
 ```
 
 Restart the service:
 
 ```bash
-sudo systemctl restart logger.service
+sudo systemctl restart network-monitor.service
 ```
 
 ---
@@ -163,13 +163,13 @@ If the script writes logs, use a dedicated directory.
 Example:
 
 ```bash
-sudo mkdir -p /var/log/logger
+sudo mkdir -p /network-monitor
 ```
 
 Update your script to write logs there:
 
 ```
-LOG_DIR="/var/log/logger"
+LOG_DIR="/network-monitor"
 ```
 
 ---
@@ -180,12 +180,12 @@ Commands for quick reference:
 
 ```bash
 chmod +x logger.sh
-sudo mv logger.sh /usr/local/bin/logger.sh
-sudo nano /etc/systemd/system/logger.service
+sudo mv logger.sh network-monitor.sh
+sudo nano /etc/systemd/system/network-monitor.service
 sudo systemctl daemon-reload
-sudo systemctl start logger.service
-sudo systemctl enable logger.service
-sudo systemctl status logger.service
+sudo systemctl start network-monitor.service
+sudo systemctl enable network-monitor.service
+sudo systemctl status network-monitor.service
 ```
 
 After completing these steps, `logger.sh` will run as a fully managed background service.
