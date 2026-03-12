@@ -174,6 +174,14 @@ The script will automatically:
 * Enable it
 * Start it
 
+## 4. Start the service
+Run the following scripts:
+```
+sudo systemctl daemon-reload
+sudo systemctl enable dns_checker_new.service
+sudo systemctl start dns_checker_new.service
+sudo systemctl status dns_checker_new.service
+```
 ---
 
 # Service Information
